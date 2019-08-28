@@ -16,6 +16,7 @@
 
 #include "drmdisplay.h"
 
+#include <sys/time.h>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -133,6 +134,7 @@ void DrmDisplay::DrmConnectorGetDCIP3Support(
 
   edid = (uint8_t *)blob->data;
   if (!edid) {
+    drmModeFreePropertyBlob(blob);
     return;
   }
 
@@ -343,6 +345,64 @@ bool DrmDisplay::GetDisplayAttribute(uint32_t config /*config*/,
   return status;
 }
 
+uint32_t DrmDisplay::FindPreferedDisplayMode(size_t modes_size) {
+  uint32_t prefer_display_mode = 0;
+  if (modes_size > 1) {
+    SPIN_LOCK(display_lock_);
+    for (size_t i = 0; i < modes_size; i++) {
+      // There is only one preferred mode per connector.
+      if (modes_[i].type & DRM_MODE_TYPE_PREFERRED) {
+        prefer_display_mode = i;
+        IHOTPLUGEVENTTRACE("Preferred display config is found. index: %d", i);
+        break;
+      }
+    }
+    SPIN_UNLOCK(display_lock_);
+  }
+  if (prefer_display_mode_ != prefer_display_mode)
+    prefer_display_mode_ = prefer_display_mode;
+  return prefer_display_mode;
+}
+
+uint32_t DrmDisplay::FindPerformaceDisplayMode(size_t modes_size) {
+  uint32_t perf_display_mode;
+  perf_display_mode = prefer_display_mode_;
+  if (modes_size >= prefer_display_mode_) {
+    int32_t prefer_width = 0, prefer_height = 0, prefer_interval = 0;
+    int32_t perf_width = 0, perf_height = 0, perf_interval = 0,
+            previous_perf_interval = 0;
+    GetDisplayAttribute(prefer_display_mode_, HWCDisplayAttribute::kWidth,
+                        &prefer_width);
+    GetDisplayAttribute(prefer_display_mode_, HWCDisplayAttribute::kHeight,
+                        &prefer_height);
+    GetDisplayAttribute(prefer_display_mode_, HWCDisplayAttribute::kRefreshRate,
+                        &prefer_interval);
+    previous_perf_interval = prefer_interval;
+    IHOTPLUGEVENTTRACE("Preferred width:%d, height:%d, interval:%d",
+                       prefer_width, prefer_height, prefer_interval);
+    for (size_t i = 0; i < modes_size; i++) {
+      if (i != prefer_display_mode_) {
+        GetDisplayAttribute(i, HWCDisplayAttribute::kWidth, &perf_width);
+        GetDisplayAttribute(i, HWCDisplayAttribute::kHeight, &perf_height);
+        GetDisplayAttribute(i, HWCDisplayAttribute::kRefreshRate,
+                            &perf_interval);
+        IHOTPLUGEVENTTRACE("EDIP item width:%d, height:%d, rate:%d", perf_width,
+                           perf_height, perf_interval);
+        if (prefer_width == perf_width && prefer_height == perf_height &&
+            prefer_interval > perf_interval &&
+            previous_perf_interval > perf_interval) {
+          perf_display_mode = i;
+          previous_perf_interval = perf_interval;
+        }
+      }
+    }
+  }
+  if (perf_display_mode_ != perf_display_mode)
+    perf_display_mode_ = perf_display_mode;
+  IHOTPLUGEVENTTRACE("PerformaceDisplayMode: %d", perf_display_mode_);
+  return perf_display_mode;
+}
+
 bool DrmDisplay::GetDisplayConfigs(uint32_t *num_configs, uint32_t *configs) {
   if (!num_configs)
     return false;
@@ -355,8 +415,16 @@ bool DrmDisplay::GetDisplayConfigs(uint32_t *num_configs, uint32_t *configs) {
     return PhysicalDisplay::GetDisplayConfigs(num_configs, configs);
   }
 
+  uint32_t prefer_display_mode = prefer_display_mode_;
+  uint32_t perf_display_mode = perf_display_mode_;
+
   if (!configs) {
-    *num_configs = modes_size;
+    prefer_display_mode = FindPreferedDisplayMode(modes_size);
+    perf_display_mode = FindPerformaceDisplayMode(modes_size);
+    if (prefer_display_mode == perf_display_mode)
+      *num_configs = 1;
+    else
+      *num_configs = 2;
     IHOTPLUGEVENTTRACE(
         "GetDisplayConfigs: Total Configs: %d pipe: %d display: %p",
         *num_configs, pipe_, this);
@@ -367,9 +435,9 @@ bool DrmDisplay::GetDisplayConfigs(uint32_t *num_configs, uint32_t *configs) {
       "GetDisplayConfigs: Populating Configs: %d pipe: %d display: %p",
       *num_configs, pipe_, this);
 
-  uint32_t size = *num_configs > modes_size ? modes_size : *num_configs;
-  for (uint32_t i = 0; i < size; i++)
-    configs[i] = i;
+  configs[0] = prefer_display_mode;
+  if (prefer_display_mode != perf_display_mode)
+    configs[1] = perf_display_mode;
 
   return true;
 }
@@ -488,6 +556,14 @@ bool DrmDisplay::ContainConnector(const uint32_t connector_id) {
   return (connector_ == connector_id);
 }
 
+void DrmDisplay::TraceFirstCommit() {
+  struct timeval te;
+  gettimeofday(&te, NULL);  // get current time
+  long long milliseconds =
+      te.tv_sec * 1000LL + te.tv_usec / 1000;  // calculate milliseconds
+  ITRACE("First frame is Committed at %lld.", milliseconds);
+}
+
 bool DrmDisplay::Commit(
     const DisplayPlaneStateList &composition_planes,
     const DisplayPlaneStateList &previous_composition_planes,
@@ -505,6 +581,10 @@ bool DrmDisplay::Commit(
     ETRACE("Failed to allocate property set %d", -ENOMEM);
     return false;
   }
+
+  // Disable not-in-used plane once DRM master is reset
+  if (first_commit_)
+    display_queue_->ResetPlanes(pset.get());
 
   if (display_state_ & kNeedsModeset) {
     if (!ApplyPendingModeset(pset.get())) {
@@ -537,7 +617,10 @@ bool DrmDisplay::Commit(
     *commit_fence = 0;
   }
 #endif
-
+  if (first_commit_) {
+    TraceFirstCommit();
+    first_commit_ = false;
+  }
   return true;
 }
 
@@ -565,8 +648,14 @@ bool DrmDisplay::CommitFrame(
         comp_plane.GetRotationType();
     if ((plane_transform != kIdentity) &&
         (rotation_type == DisplayPlaneState::RotationType::kDisplayRotation)) {
-      HwcRect<int> rotated_rect =
-          RotateScaleRect(display_rect, width_, height_, plane_transform);
+      HwcRect<int> rotated_rect;
+      if (layer->IsVideoLayer()) {
+        rotated_rect =
+            RotateRect(display_rect, width_, height_, plane_transform);
+      } else {
+        rotated_rect =
+            RotateScaleRect(display_rect, width_, height_, plane_transform);
+      }
       layer->SetDisplayFrame(rotated_rect);
     }
 
@@ -577,10 +666,11 @@ bool DrmDisplay::CommitFrame(
       plane->SetNativeFence(-1);
     }
 
-    if (comp_plane.Scanout() && !comp_plane.IsSurfaceRecycled())
+    if (comp_plane.Scanout() && !comp_plane.IsSurfaceRecycled()) {
       plane->SetBuffer(layer->GetSharedBuffer());
+    }
 
-    if (!plane->UpdateProperties(pset, crtc_id_, layer))
+    if (!plane->UpdateProperties(pset, crtc_id_, comp_plane))
       return false;
   }
 
@@ -588,7 +678,6 @@ bool DrmDisplay::CommitFrame(
     DrmPlane *plane = static_cast<DrmPlane *>(comp_plane.GetDisplayPlane());
     if (plane->InUse())
       continue;
-
     plane->Disable(pset);
   }
 
@@ -660,8 +749,10 @@ void DrmDisplay::GetDrmObjectProperty(const char *name,
     ScopedDrmPropertyPtr property(drmModeGetProperty(gpu_fd_, props->props[i]));
     if (property && !strcmp(property->name, name)) {
       *id = property->prop_id;
+      property.reset();
       break;
     }
+    property.reset();
   }
   if (!(*id))
     ETRACE("Could not find property %s", name);
@@ -689,8 +780,10 @@ void DrmDisplay::GetDrmHDCPObjectProperty(
           }
         }
       }
+      property.reset();
       break;
     }
+    property.reset();
   }
   if (!(*id))
     ETRACE("Could not find property %s", name);
@@ -704,8 +797,10 @@ void DrmDisplay::GetDrmObjectPropertyValue(
     ScopedDrmPropertyPtr property(drmModeGetProperty(gpu_fd_, props->props[i]));
     if (property && !strcmp(property->name, name)) {
       *value = props->prop_values[i];
+      property.reset();
       break;
     }
+    property.reset();
   }
   if (!(*value))
     ETRACE("Could not find property value %s", name);
@@ -1045,11 +1140,14 @@ bool DrmDisplay::PopulatePlanes(
         drmModeGetPlane(gpu_fd_, plane_resources->planes[i]));
     if (!drm_plane) {
       ETRACE("Failed to get plane ");
+      plane_resources.reset();
       return false;
     }
 
-    if (!(pipe_bit & drm_plane->possible_crtcs))
+    if (!(pipe_bit & drm_plane->possible_crtcs)) {
+      drm_plane.reset();
       continue;
+    }
 
     uint32_t formats_size = drm_plane->count_formats;
     plane_ids.insert(drm_plane->plane_id);
@@ -1061,7 +1159,7 @@ bool DrmDisplay::PopulatePlanes(
 
     bool use_modifier = true;
 #ifdef MODIFICATOR_WA
-    use_modifier = (manager_->GetConnectedPhysicalDisplayCount() < 3);
+    use_modifier = (manager_->GetConnectedPhysicalDisplayCount() < 2);
     if (i >= 2)
       use_modifier = false;
 #endif
@@ -1072,10 +1170,13 @@ bool DrmDisplay::PopulatePlanes(
         overlay_planes.emplace_back(plane.release());
       }
     }
+
+    drm_plane.reset();
   }
 
   if (overlay_planes.empty()) {
     ETRACE("Failed to get primary plane for display %d", crtc_id_);
+    plane_resources.reset();
     return false;
   }
 
@@ -1089,6 +1190,7 @@ bool DrmDisplay::PopulatePlanes(
     overlay_planes.emplace_back(cursor_plane.release());
   }
 
+  plane_resources.reset();
   return true;
 }
 
@@ -1108,12 +1210,11 @@ void DrmDisplay::NotifyClientsOfDisplayChangeStatus() {
   manager_->NotifyClientsOfDisplayChangeStatus();
 }
 
-bool DrmDisplay::TestCommit(
-    const std::vector<OverlayPlane> &commit_planes) const {
+bool DrmDisplay::TestCommit(const DisplayPlaneStateList &composition) const {
   ScopedDrmAtomicReqPtr pset(drmModeAtomicAlloc());
-  for (auto i = commit_planes.begin(); i != commit_planes.end(); i++) {
-    DrmPlane *plane = static_cast<DrmPlane *>(i->plane);
-    if (!(plane->UpdateProperties(pset.get(), crtc_id_, i->layer, true))) {
+  for (auto &plane_state : composition) {
+    DrmPlane *plane = static_cast<DrmPlane *>(plane_state.GetDisplayPlane());
+    if (!(plane->UpdateProperties(pset.get(), crtc_id_, plane_state, true))) {
       return false;
     }
   }

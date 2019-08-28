@@ -22,12 +22,12 @@
 
 #include <xf86drmMode.h>
 
-#include <drmscopedtypes.h>
-
 #include <vector>
 
 #include "displayplane.h"
+#include "displayplanestate.h"
 #include "drmbuffer.h"
+#include "drmscopedtypes.h"
 
 namespace hwcomposer {
 
@@ -44,7 +44,7 @@ class DrmPlane : public DisplayPlane {
                   bool use_modifer);
 
   bool UpdateProperties(drmModeAtomicReqPtr property_set, uint32_t crtc_id,
-                        const OverlayLayer* layer,
+                        const DisplayPlaneState& plane,
                         bool test_commit = false) const;
 
   void SetNativeFence(int32_t fd);

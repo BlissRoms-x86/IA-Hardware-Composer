@@ -75,13 +75,21 @@ bool DrmDisplayManager::Initialize() {
   }
 
   ScopedDrmResourcesPtr res(drmModeGetResources(fd_));
-  if (res->count_crtcs == 0)
+  if (!res) {
+    ETRACE("Failed to get resources");
     return false;
+  }
+
+  if (res->count_crtcs == 0) {
+    res.reset();
+    return false;
+  }
 
   for (int32_t i = 0; i < res->count_crtcs; ++i) {
     ScopedDrmCrtcPtr c(drmModeGetCrtc(fd_, res->crtcs[i]));
     if (!c) {
       ETRACE("Failed to get crtc %d", res->crtcs[i]);
+      res.reset();
       return false;
     }
 
@@ -89,12 +97,15 @@ bool DrmDisplayManager::Initialize() {
         new DrmDisplay(fd_, i, c->crtc_id, this));
 
     displays_.emplace_back(std::move(display));
+
+    c.reset();
   }
 
 #ifndef DISABLE_HOTPLUG_NOTIFICATION
   hotplug_fd_ = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
   if (hotplug_fd_ < 0) {
     ETRACE("Failed to create socket for hot plug monitor. %s", PRINTERROR());
+    res.reset();
     return true;
   }
 
@@ -108,6 +119,7 @@ bool DrmDisplayManager::Initialize() {
   if (ret) {
     ETRACE("Failed to bind sockaddr_nl and hot plug monitor fd. %s",
            PRINTERROR());
+    res.reset();
     return true;
   }
 
@@ -115,6 +127,7 @@ bool DrmDisplayManager::Initialize() {
 #endif
 
   IHOTPLUGEVENTTRACE("DisplayManager Initialization succeeded.");
+  res.reset();
   return true;
 }
 
@@ -233,9 +246,12 @@ bool DrmDisplayManager::UpdateDisplayState() {
       break;
     }
     // check if a monitor is connected.
-    if (connector->connection != DRM_MODE_CONNECTED)
+    if (connector->connection != DRM_MODE_CONNECTED) {
+      connector.reset();
       continue;
+    }
     connected_display_count_++;
+    connector.reset();
   }
 
   for (uint32_t i = 0; i < total_connectors; ++i) {
@@ -246,15 +262,20 @@ bool DrmDisplayManager::UpdateDisplayState() {
       break;
     }
     // check if a monitor is connected.
-    if (connector->connection != DRM_MODE_CONNECTED)
+    if (connector->connection != DRM_MODE_CONNECTED) {
+      connector.reset();
       continue;
+    }
 
     // Ensure we have atleast one valid mode.
-    if (connector->count_modes == 0)
+    if (connector->count_modes == 0) {
+      connector.reset();
       continue;
+    }
 
     if (connector->encoder_id == 0) {
       no_encoder.emplace_back(i);
+      connector.reset();
       continue;
     }
 
@@ -290,6 +311,9 @@ bool DrmDisplayManager::UpdateDisplayState() {
         }
       }
     }
+
+    encoder.reset();
+    connector.reset();
   }
 
   // Deal with connectors with encoder_id == 0.
@@ -334,7 +358,11 @@ bool DrmDisplayManager::UpdateDisplayState() {
           break;
         }
       }
+
+      encoder.reset();
     }
+
+    connector.reset();
   }
 
   for (auto &display : displays_) {
@@ -364,6 +392,7 @@ bool DrmDisplayManager::UpdateDisplayState() {
   if (device_.IsReservedDrmPlane())
     RemoveUnreservedPlanes();
 
+  res.reset();
   return true;
 }
 
@@ -442,6 +471,28 @@ void DrmDisplayManager::IgnoreUpdates() {
   for (size_t i = 0; i < size; ++i) {
     displays_.at(i)->IgnoreUpdates();
   }
+}
+
+bool DrmDisplayManager::IsDrmMasterByDefault() {
+  spin_lock_.lock();
+  if (drm_master_) {
+    spin_lock_.unlock();
+    return drm_master_;
+  }
+  drm_magic_t magic = 0;
+  int ret = 0;
+  ret = drmGetMagic(fd_, &magic);
+  if (ret)
+    ETRACE("Failed to call drmGetMagic : %s", PRINTERROR());
+  else {
+    ret = drmAuthMagic(fd_, magic);
+    if (ret)
+      ETRACE("Failed to call drmAuthMagic : %s", PRINTERROR());
+    else
+      drm_master_ = true;
+  }
+  spin_lock_.unlock();
+  return drm_master_;
 }
 
 void DrmDisplayManager::setDrmMaster(bool must_set) {

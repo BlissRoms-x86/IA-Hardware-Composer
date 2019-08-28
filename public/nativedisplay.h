@@ -428,6 +428,13 @@ class NativeDisplay {
     return false;
   }
 
+  virtual void MarkFirstCommit() {
+  }
+
+  virtual int GetTotalOverlays() const {
+    return 0;
+  }
+
  protected:
   friend class PhysicalDisplay;
   friend class GpuDevice;

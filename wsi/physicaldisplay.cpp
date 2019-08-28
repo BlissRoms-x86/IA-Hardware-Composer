@@ -152,6 +152,10 @@ void PhysicalDisplay::Connect() {
 
   SPIN_LOCK(modeset_lock_);
   if (connection_state_ & kConnected) {
+    IHOTPLUGEVENTTRACE(
+        "PhysicalDisplay::Connect connected already, return with power mode "
+        "update.");
+    UpdatePowerMode();
     SPIN_UNLOCK(modeset_lock_);
     return;
   }
@@ -377,7 +381,7 @@ int PhysicalDisplay::RegisterVsyncCallback(
 
 void PhysicalDisplay::RegisterRefreshCallback(
     std::shared_ptr<RefreshCallback> callback, uint32_t display_id) {
-  return display_queue_->RegisterRefreshCallback(callback, display_id);
+  display_queue_->RegisterRefreshCallback(callback, display_id);
 }
 
 void PhysicalDisplay::RegisterHotPlugCallback(
@@ -483,7 +487,7 @@ bool PhysicalDisplay::PopulatePlanes(
 }
 
 bool PhysicalDisplay::TestCommit(
-    const std::vector<OverlayPlane> & /*commit_planes*/) const {
+    const DisplayPlaneStateList & /*commit_planes*/) const {
   ETRACE("TestCommit unimplemented in PhysicalDisplay.");
   return false;
 }
@@ -647,5 +651,12 @@ bool PhysicalDisplay::GetDisplayName(uint32_t *size, char *name) {
   *size = std::min<uint32_t>(static_cast<uint32_t>(length + 1), *size);
   strncpy(name, string.c_str(), *size);
   return true;
+}
+
+int PhysicalDisplay::GetTotalOverlays() const {
+  if (display_queue_)
+    return display_queue_->GetTotalOverlays();
+  else
+    return 0;
 }
 }  // namespace hwcomposer
